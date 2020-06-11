@@ -1,0 +1,339 @@
+def GUID = "84ae"
+
+pipeline {
+  agent {
+    kubernetes {
+      label "maven-skopeo-agent"
+      cloud "openshift"
+      inheritFrom "maven"
+      containerTemplate {
+        name "jnlp"
+        image "image-registry.openshift-image-registry.svc:5000/${GUID}-jenkins/jenkins-agent-appdev:latest"
+        resourceRequestMemory "2Gi"
+        resourceLimitMemory "2Gi"
+        resourceRequestCpu "2"
+        resourceLimitCpu "2"
+      }
+    }
+  }
+  environment {
+    // Define global variables
+    // Set Maven command to always include Nexus Settings
+    // NOTE: Somehow an inline pod template in a declarative pipeline
+    //       needs the "scl_enable" before calling maven.
+    mvnCmd = "source /usr/local/bin/scl_enable && mvn -s ./nexus_settings.xml"
+    //mvnCmd = "source /usr/local/bin/scl_enable && mvn"
+
+    // Images and Projects
+    imageName   = "${GUID}-tasks"
+    devProject  = "${GUID}-tasks-dev"
+    prodProject = "${GUID}-tasks-prod"
+
+    // Tags
+    devTag      = "0.0-0"
+    prodTag     = "0.0"
+
+    // Blue-Green Settings
+    destApp     = "tasks-green"
+    activeApp   = ""
+
+    // DNS
+    svcDomain = "svc.cluster.local:8080"
+    routeDomain = "apps.shared.na.openshift.opentlc.com"
+  }
+
+  stages {
+    stage('Checkout Source') {
+      steps {
+        checkout scm
+        //git credentialsId: 'gitea',
+        //url: 'https://homework-gitea.apps.shared.na.openshift.opentlc.com/dliderma-redhat.com/homework.git'
+
+        dir('openshift-tasks') {
+          script {
+            def pom = readMavenPom file: 'pom.xml'
+            def version = pom.version
+
+            // Set the tag for the development image: version + build number
+            devTag  = "${version}-" + currentBuild.number
+            // Set the tag for the production image: version
+            prodTag = "${version}"
+
+            // Patch Source artifactId to include GUID
+            sh "sed -i 's/GUID/${GUID}/g' ./pom.xml"
+          }
+        }
+      }
+    }
+    stage('Build war') {
+      steps {
+        dir('openshift-tasks') {
+          echo "Building version ${devTag}"
+          script {
+            sh "${mvnCmd} install -DskipTests=true"
+          }
+          stash includes: 'target/openshift-tasks.war', name: 'artifact'
+        }
+      }
+    }
+    stage('Unit Tests') {
+      steps {
+        dir('openshift-tasks') {
+          echo "Running Unit Tests"
+          script {
+            sh "${mvnCmd} test"
+          }
+        }
+      }
+      post {
+        always {
+            junit 'openshift-tasks/target/surefire-reports/*.xml'
+        }
+      }
+    }
+    stage('Code Analysis') {
+      steps {
+        dir('openshift-tasks') {
+          script {
+            echo "Running Code Analysis"
+            // Execute Sonarqube Tests
+            //      Your project name should be "${GUID}-${JOB_BASE_NAME}-${devTag}"
+            //      Your project version should be ${devTag}
+            sh "${mvnCmd} sonar:sonar -Dsonar.host.url=http://homework-sonarqube.gpte-hw-cicd.svc.cluster.local:9000 -Dsonar.projectName=${GUID}-${JOB_BASE_NAME}-${devTag} -Dsonar.projectVersion=${devTag}"
+
+          }
+        }
+      }
+    }
+    // Publish the built war file to Nexus
+    stage('Publish to Nexus') {
+      steps {
+        dir('openshift-tasks') {
+          echo "Publish to Nexus"
+          sh "${mvnCmd} deploy:deploy-file -DskipTests -DgroupId=com.redhat -DartifactId=${imageName} -Dversion=${devTag} -Durl=http://homework-nexus.gpte-hw-cicd.svc.cluster.local:8081/repository/releases/ -Dpackaging=war -Dfile=target/openshift-tasks.war -DrepositoryId=nexus"
+        }
+      }
+    }
+    // Build the OpenShift Image in OpenShift and tag it.
+    stage('Build and Tag OpenShift Image') {
+      steps {
+        echo "Building OpenShift container image ${imageName}:${devTag}"
+        script {
+          openshift.withCluster() {
+            openshift.withProject("${devProject}") {
+              if (! openshift.selector('bc', 'tasks').exists()) {
+                openshift.newBuild("--name=tasks", "--binary=true", "--image-stream=jboss-eap72-openshift:1.0")
+              }
+              sleep 5
+              openshift.selector("bc", "tasks").startBuild("--from-file=openshift-tasks/target/openshift-tasks.war", "--wait")
+              openshift.tag("${imageName}:latest", "${imageName}:${devTag}")
+
+            }
+          }
+        }
+      }
+    }
+    stage('Create Dev') {
+      when {
+        expression {
+          openshift.withCluster() {
+            openshift.withProject("${devProject}") {
+              return !openshift.selector('dc', 'tasks').exists()
+            }
+          }
+        }
+      }
+      steps {
+        script {
+          openshift.withCluster() {
+            openshift.withProject("${devProject}") {
+              def app = openshift.newApp("tasks:${devTag}")
+              //app.narrow("svc").expose();
+              openshift.set("probe dc/tasks --readiness --get-url=http://:8080/ --initial-delay-seconds=60 --failure-threshold=3")
+              openshift.set("probe dc/tasks --liveness  --get-url=http://:8080/ --initial-delay-seconds=60 --failure-threshold=3 --period-seconds=10")
+              def dc = openshift.selector("dc", "tasks")
+              while (dc.object().spec.replicas != dc.object().status.availableReplicas) {
+                sleep 10
+              }
+              openshift.set("triggers", "dc/tasks", "--manual")
+            }
+          }
+        }
+      }
+    }
+    stage('Deploy to Dev') {
+      steps {
+        dir('openshift-tasks') {
+          echo "Deploying container image to Development Project"
+          script {
+            openshift.withCluster() {
+              openshift.withProject("${devProject}") {
+                openshift.set("triggers", "dc/tasks", "--manual")
+                openshift.set("image", "dc", "tasks", "tasks=image-registry.openshift-image-registry.svc.cluster.local:5000/${devProject}/${imageName}:${devTag}")
+                openshift.set("env", "dc", "tasks", "VERSION=${devTag}(tasks-dev)")
+                //  (Re-) Create ConfigMap
+                if (openshift.selector('configmap', 'tasks-config').exists()) {
+                  openshift.delete("configmap", "tasks-config")
+                }
+                openshift.create("configmap",
+                  "tasks-config",
+                  "--from-file=./configuration/application-users.properties",
+                  "--from-file=./configuration/application-roles.properties")
+                openshift.selector("dc", "tasks").rollout().latest()
+                //  Make sure the application is running and ready before proceeding
+                def dc = openshift.selector("dc", "tasks").object()
+                def dc_version = dc.status.latestVersion
+                def rc = openshift.selector("rc", "tasks-${dc_version}").object()
+
+                echo "Waiting for ReplicationController tasks-${dc_version} to be ready"
+                while (rc.spec.replicas != rc.status.readyReplicas) {
+                    sleep 5
+                    rc = openshift.selector("rc", "tasks-${dc_version}").object()
+                }
+                sleep 10
+                sh "curl http://tasks.${GUID}-tasks-dev.svc.cluster.local:8080 | grep tasks-dev"
+              }
+            }
+          }
+        }
+      }
+    }
+    stage('Integration Tests') {
+      steps {
+        echo "Running Integration Tests"
+        script {
+            def status = "000"
+            // Create a new task called "integration_test_1"
+            echo "Creating task"
+            status = sh(returnStdout: true, script: "curl -sw '%{response_code}' -o /dev/null -u 'tasks:redhat1' -H 'Content-Length: 0' -X POST http://tasks.${GUID}-tasks-dev.svc.cluster.local:8080/ws/tasks/integration_test_1").trim()
+
+            echo "Status: " + status
+            if (status != "201") {
+                error 'Integration Create Test Failed!'
+            }
+            sleep 3
+            echo "Retrieving tasks"
+            status = sh(returnStdout: true,
+              script: "curl -sw '%{response_code}' -o /dev/null -u 'tasks:redhat1' -H 'Accept: application/json' -X GET http://tasks.${GUID}-tasks-dev.svc.cluster.local:8080/ws/tasks/1").trim()
+            //status = sh(returnStdout: true,
+            //    script: "curl -sw '%{response_code}' -o /dev/null http://tasks.${GUID}-tasks-dev.svc.cluster.local:8080/").trim()
+            echo "Status: " + status
+            if (status != "200") {
+                error 'Integration Get Test Failed!'
+            }
+
+            echo "Deleting tasks"
+            status = sh(returnStdout: true,
+              script: "curl -sw '%{response_code}' -o /dev/null -u 'tasks:redhat1' -X DELETE http://tasks.${GUID}-tasks-dev.svc.cluster.local:8080/ws/tasks/1").trim()
+            echo "Status: " + status
+            if (status != "204") {
+                error 'Integration Create Test Failed!'
+            }
+        }
+      }
+    }
+    stage('Copy Image to Nexus Container Registry') {
+      steps {
+        echo "Copy image to Nexus Container Registry"
+        script {
+          sh "skopeo copy --src-tls-verify=false --src-creds=dliderma-redhat.com:\$(oc whoami -t) --dest-tls-verify=false --dest-creds admin:redhat docker://image-registry.openshift-image-registry.svc.cluster.local:5000/${devProject}/${GUID}-tasks:${devTag} docker://homework-nexus-registry.gpte-hw-cicd.svc.cluster.local:5000/${devProject}/${imageName}:${devTag}"
+          echo "Tag the image with the production tag"
+          openshift.withCluster() {
+            openshift.withProject("${prodProject}") {
+                  openshift.tag("${devProject}/${imageName}:${devTag}", "${devProject}/${imageName}:${prodTag}")
+            }
+          }
+        }
+      }
+    }
+    stage('Blue/Green Production Deployment') {
+      steps {
+        echo "Blue/Green Deployment"
+
+          script {
+            openshift.withCluster() {
+              openshift.withProject("${prodProject}") {
+                if (! openshift.selector('dc', 'tasks-blue').exists()) {
+                  sh "sed -i 's/GUID/${GUID}/g' manifests/tasks-dc-blue.yaml"
+                  openshift.apply('-f manifests/tasks-dc-blue.yaml')
+                }
+                if (! openshift.selector('svc', 'tasks-blue').exists()) {
+                  openshift.apply('-f manifests/tasks-svc-blue.yaml ')
+                }
+                if (! openshift.selector('dc', 'tasks-green').exists()) {
+                  sh "sed -i 's/GUID/${GUID}/g' manifests/tasks-dc-green.yaml"
+                  openshift.apply('-f manifests/tasks-dc-green.yaml')
+                }
+                if (! openshift.selector('svc', 'tasks-green').exists()) {
+                  openshift.apply('-f manifests/tasks-svc-green.yaml ')
+                }
+                if (! openshift.selector('route', 'tasks').exists()) {
+                  openshift.apply('-f manifests/tasks-route-prod.yaml')
+                }
+                activeApp = openshift.selector("route", "tasks").object().spec.to.name
+                destApp = activeApp.contains('blue') ? 'tasks-green' : 'tasks-blue';
+
+                echo "Active Application: ${activeApp}"
+                echo "Other Application: ${destApp}"
+
+                openshift.set("image",
+                  "dc/${destApp}",
+                  "${destApp}=image-registry.openshift-image-registry.svc.cluster.local:5000/${devProject}/${imageName}:${prodTag}")
+                  //if (activeApp.contains('blue')) {
+                  //  openshift.set("env", "dc", "${destApp}", "VERSION=${prodTag}(tasks-green)")
+                  //  openshift.set("env", "dc", "${activeApp}", "VERSION=${prodTag}(tasks-blue)")
+                  //} else {
+                  //  openshift.set("env", "dc", "${destApp}", "VERSION=${prodTag}(tasks-blue)")
+                  //  openshift.set("env", "dc", "${activeApp}", "VERSION=${prodTag}(tasks-green)")
+                  //}
+                  openshift.set("env", "dc", "${destApp}", "VERSION=${prodTag}(tasks-blue)")
+                  openshift.set("env", "dc", "${activeApp}", "VERSION=${prodTag}(tasks-green)")
+
+                if (openshift.selector('configmap', "${destApp}-config").exists()) {
+                  openshift.selector("configmap", "${destApp}-config").delete()
+                }
+                dir('openshift-tasks') {
+                  openshift.create("configmap",
+                    "${destApp}-config",
+                    "--from-file=./configuration/application-users.properties",
+                    "--from-file=./configuration/application-roles.properties" )
+                }
+                // Deploy into the other application
+                openshift.selector("dc", "${destApp}").rollout().latest();
+
+                // Make sure the application is running and ready before proceeding
+                def dc_next = openshift.selector("dc", "${destApp}").object()
+                def dc_version = dc_next.status.latestVersion
+                def rc_next = openshift.selector("rc", "${destApp}-${dc_version}").object()
+
+                echo "Waiting for ReplicationController ${destApp}-${dc_version} to be ready"
+                while (rc_next.spec.replicas != rc_next.status.readyReplicas) {
+                    sleep 5
+                    rc_next = openshift.selector("rc", "${destApp}-${dc_version}").object()
+                }
+                sleep 10
+                sh "curl http://${destApp}.${GUID}-tasks-prod.svc.cluster.local:8080 | grep tasks-"
+                currentBuild.description = "${destApp}"
+              }
+            }
+          }
+      }
+    }
+    stage('Switch over to new Version') {
+      steps {
+        echo "Switching Production application to ${destApp}."
+        script {
+          openshift.withCluster() {
+            openshift.withProject("${prodProject}") {
+              def route = openshift.selector("route", "tasks").object()
+              route.spec.to.name="${destApp}"
+              openshift.apply(route)
+            }
+          }
+          sleep 10
+          sh "curl http://tasks-${GUID}-tasks-prod.apps.shared.na.openshift.opentlc.com | grep tasks-"
+        }
+      }
+    }
+  }
+}
